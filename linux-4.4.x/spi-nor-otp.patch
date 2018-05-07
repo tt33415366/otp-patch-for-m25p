@@ -1,0 +1,696 @@
+diff --git a/drivers/mtd/devices/m25p80.c b/drivers/mtd/devices/m25p80.c
+index 496b4c7..5d6e6d3 100644
+--- a/drivers/mtd/devices/m25p80.c
++++ b/drivers/mtd/devices/m25p80.c
+@@ -47,18 +47,18 @@ static int m25p80_read_reg(struct spi_nor *nor, u8 code, u8 *val, int len)
+ 	return ret;
+ }
+ 
+-static void m25p_addr2cmd(struct spi_nor *nor, unsigned int addr, u8 *cmd)
++static void m25p_addr2cmd(unsigned int addr, u8 addr_width, u8 *cmd)
+ {
+ 	/* opcode is in cmd[0] */
+-	cmd[1] = addr >> (nor->addr_width * 8 -  8);
+-	cmd[2] = addr >> (nor->addr_width * 8 - 16);
+-	cmd[3] = addr >> (nor->addr_width * 8 - 24);
+-	cmd[4] = addr >> (nor->addr_width * 8 - 32);
++	cmd[1] = addr >> (addr_width * 8 -  8);
++	cmd[2] = addr >> (addr_width * 8 - 16);
++	cmd[3] = addr >> (addr_width * 8 - 24);
++	cmd[4] = addr >> (addr_width * 8 - 32);
+ }
+ 
+-static int m25p_cmdsz(struct spi_nor *nor)
++static int m25p_cmdsz(u8 addr_width)
+ {
+-	return 1 + nor->addr_width;
++	return 1 + addr_width;
+ }
+ 
+ static int m25p80_write_reg(struct spi_nor *nor, u8 opcode, u8 *buf, int len)
+@@ -80,7 +80,7 @@ static void m25p80_write(struct spi_nor *nor, loff_t to, size_t len,
+ 	struct spi_device *spi = flash->spi;
+ 	struct spi_transfer t[2] = {};
+ 	struct spi_message m;
+-	int cmd_sz = m25p_cmdsz(nor);
++	int cmd_sz = m25p_cmdsz(nor->addr_width);
+ 
+ 	spi_message_init(&m);
+ 
+@@ -88,7 +88,7 @@ static void m25p80_write(struct spi_nor *nor, loff_t to, size_t len,
+ 		cmd_sz = 1;
+ 
+ 	flash->command[0] = nor->program_opcode;
+-	m25p_addr2cmd(nor, to, flash->command);
++	m25p_addr2cmd(to, nor->addr_width, flash->command);
+ 
+ 	t[0].tx_buf = flash->command;
+ 	t[0].len = cmd_sz;
+@@ -103,9 +103,9 @@ static void m25p80_write(struct spi_nor *nor, loff_t to, size_t len,
+ 	*retlen += m.actual_length - cmd_sz;
+ }
+ 
+-static inline unsigned int m25p80_rx_nbits(struct spi_nor *nor)
++static inline unsigned int m25p80_rx_nbits(enum read_mode flash_read)
+ {
+-	switch (nor->flash_read) {
++	switch (flash_read) {
+ 	case SPI_NOR_DUAL:
+ 		return 2;
+ 	case SPI_NOR_QUAD:
+@@ -135,28 +135,105 @@ static int m25p80_read(struct spi_nor *nor, loff_t from, size_t len,
+ 	memset(t, 0, (sizeof t));
+ 
+ 	flash->command[0] = nor->read_opcode;
+-	m25p_addr2cmd(nor, from, flash->command);
++	m25p_addr2cmd(from, nor->addr_width, flash->command);
+ 
+ 	if (dummy == 1)
+ 		t[0].dummy = true;
+ 
+ 	t[0].type = SPI_TRANSFER_FLASH_READ_CMD;
+ 	t[0].tx_buf = flash->command;
+-	t[0].len = m25p_cmdsz(nor) + dummy;
++	t[0].len = m25p_cmdsz(nor->addr_width) + dummy;
+ 	spi_message_add_tail(&t[0], &m);
+ 
+ 	t[1].type = SPI_TRANSFER_FLASH_READ_DATA;
+ 	t[1].rx_buf = buf;
+-	t[1].rx_nbits = m25p80_rx_nbits(nor);
++	t[1].rx_nbits = m25p80_rx_nbits(nor->flash_read);
+ 	t[1].len = len;
+ 	spi_message_add_tail(&t[1], &m);
+ 
+ 	spi_sync(spi, &m);
+ 
+-	*retlen = m.actual_length - m25p_cmdsz(nor) - dummy;
++	*retlen = m.actual_length - m25p_cmdsz(nor->addr_width) - dummy;
+ 	return 0;
+ }
+ 
++static ssize_t m25p80_read_xfer(struct spi_nor *nor,
++		struct spi_nor_xfer_cfg *cfg,
++		u8 *buf, size_t len)
++{
++	struct m25p *flash = nor->priv;
++	struct spi_device *spi = flash->spi;
++	struct spi_transfer t[2] = {};
++	struct spi_message m;
++	unsigned int dummy = cfg->dummy_cycles;
++	ssize_t ret;
++
++	/* convert the dummy cycles to the number of bytes */
++	dummy /= 8;
++
++	spi_message_init(&m);
++
++	flash->command[0] = cfg->cmd;
++	m25p_addr2cmd(cfg->addr, cfg->addr_width, flash->command);
++
++	t[0].tx_buf = flash->command;
++	t[0].len = m25p_cmdsz(cfg->addr_width) + dummy;
++	spi_message_add_tail(&t[0], &m);
++
++	t[1].rx_buf = buf;
++	t[1].rx_nbits = m25p80_rx_nbits(cfg->mode);
++	t[1].len = len;
++	spi_message_add_tail(&t[1], &m);
++
++	ret = spi_sync(spi, &m);
++	if (ret)
++		return ret;
++
++	ret = m.actual_length - m25p_cmdsz(cfg->addr_width) - dummy;
++	if (ret < 0)
++		return -EIO;
++	return ret;
++}
++
++static ssize_t m25p80_write_xfer(struct spi_nor *nor,
++		struct spi_nor_xfer_cfg *cfg,
++		u8 *buf, size_t len)
++{
++	struct m25p *flash = nor->priv;
++	struct spi_device *spi = flash->spi;
++	struct spi_transfer t[2] = {};
++	struct spi_message m;
++	unsigned int dummy = cfg->dummy_cycles;
++	ssize_t ret;
++
++	/* convert the dummy cycles to the number of bytes */
++	dummy /= 8;
++
++	spi_message_init(&m);
++
++	flash->command[0] = cfg->cmd;
++	m25p_addr2cmd(cfg->addr, cfg->addr_width, flash->command);
++
++	t[0].tx_buf = flash->command;
++	t[0].len = m25p_cmdsz(cfg->addr_width) + dummy;
++	spi_message_add_tail(&t[0], &m);
++
++	if (len) {
++		t[1].tx_buf = buf;
++		t[1].len = len;
++		spi_message_add_tail(&t[1], &m);
++	}
++
++	ret = spi_sync(spi, &m);
++	if (ret)
++		return ret;
++
++	ret = m.actual_length - m25p_cmdsz(cfg->addr_width) - dummy;
++	if (ret < 0)
++		return -EIO;
++	return ret;
++}
++
+ static int m25p80_erase(struct spi_nor *nor, loff_t offset)
+ {
+ 	struct m25p *flash = nor->priv;
+@@ -166,9 +243,9 @@ static int m25p80_erase(struct spi_nor *nor, loff_t offset)
+ 
+ 	/* Set up command buffer. */
+ 	flash->command[0] = nor->erase_opcode;
+-	m25p_addr2cmd(nor, offset, flash->command);
++	m25p_addr2cmd(offset, nor->addr_width, flash->command);
+ 
+-	spi_write(flash->spi, flash->command, m25p_cmdsz(nor));
++	spi_write(flash->spi, flash->command, m25p_cmdsz(nor->addr_width));
+ 
+ 	return 0;
+ }
+@@ -202,6 +279,8 @@ static int m25p_probe(struct spi_device *spi)
+ 	nor->erase = m25p80_erase;
+ 	nor->write_reg = m25p80_write_reg;
+ 	nor->read_reg = m25p80_read_reg;
++	nor->read_xfer = m25p80_read_xfer;
++	nor->write_xfer = m25p80_write_xfer;
+ 
+ 	nor->dev = &spi->dev;
+ 	nor->flash_node = spi->dev.of_node;
+diff --git a/drivers/mtd/spi-nor/spi-nor.c b/drivers/mtd/spi-nor/spi-nor.c
+index 71f43a5..991958d 100644
+--- a/drivers/mtd/spi-nor/spi-nor.c
++++ b/drivers/mtd/spi-nor/spi-nor.c
+@@ -17,12 +17,15 @@
+ #include <linux/mutex.h>
+ #include <linux/math64.h>
+ #include <linux/sizes.h>
++#include <linux/slab.h>
+ 
+ #include <linux/mtd/mtd.h>
+ #include <linux/of_platform.h>
+ #include <linux/spi/flash.h>
+ #include <linux/mtd/spi-nor.h>
+ 
++#include <asm/div64.h>
++
+ /* Define max times to check status register before we give up. */
+ 
+ /*
+@@ -68,6 +71,13 @@ struct flash_info {
+ #define	SPI_NOR_DUAL_READ	0x20    /* Flash supports Dual Read */
+ #define	SPI_NOR_QUAD_READ	0x40    /* Flash supports Quad Read */
+ #define	USE_FSR			0x80	/* use flag status register */
++#define SPI_NOR_HAS_OTP		BIT(12)	/* Flash supports OTP */
++	unsigned int	otp_size;	/* OTP size in bytes */
++	u16				n_otps;		/* Number of OTP banks */
++	loff_t			otp_start_addr;	/* Starting address of OTP area */
++
++	/* Difference between consecutive OTP banks if there are many */
++	loff_t			otp_addr_offset;
+ };
+ 
+ #define JEDEC_MFR(info)	((info)->id[0])
+@@ -131,6 +141,19 @@ static int read_cr(struct spi_nor *nor)
+ 	return val;
+ }
+ 
++static int write_cr(struct spi_nor *nor, u8 val)
++{
++	int ret;
++
++	ret = nor->write_reg(nor, SPINOR_OP_WRCR, &val, 1);
++	if (ret < 0) {
++		dev_err(nor->dev, "error %d writing CR\n", ret);
++		return ret;
++	}
++
++	return 0;
++}
++
+ /*
+  * Dummy Cycle calculation for different type of read.
+  * It can be used to support more commands with
+@@ -649,6 +672,12 @@ static int spi_nor_is_locked(struct mtd_info *mtd, loff_t ofs, uint64_t len)
+ 		.addr_width = (_addr_width),				\
+ 		.flags = (_flags),
+ 
++#define OTP_INFO(_otp_size, _n_otps, _otp_start_addr, _otp_addr_offset)	\
++		.otp_size = (_otp_size),				\
++		.n_otps = (_n_otps),					\
++		.otp_start_addr = (_otp_start_addr),			\
++		.otp_addr_offset = (_otp_addr_offset),
++
+ /* NOTE: double check command sets and memory organization when you add
+  * more nor chips.  This current list focusses on newer chips, which
+  * have been converging on command sets which including JEDEC ID.
+@@ -850,7 +879,7 @@ static const struct flash_info spi_nor_ids[] = {
+ 	{ "w25q80", INFO(0xef5014, 0, 64 * 1024,  16, SECT_4K) },
+ 	{ "w25q80bl", INFO(0xef4014, 0, 64 * 1024,  16, SECT_4K) },
+ 	{ "w25q128", INFO(0xef4018, 0, 64 * 1024, 256, SECT_4K) },
+-	{ "w25q256", INFO(0xef4019, 0, 64 * 1024, 512, SECT_4K) },
++	{ "w25q256", INFO(0xef4019, 0, 64 * 1024, 512, SECT_4K | SPI_NOR_HAS_OTP) OTP_INFO(256, 3, 0x1000, 0x1000) },
+ 
+ 	/* Catalyst / On Semiconductor -- non-JEDEC */
+ 	{ "cat25c11", CAT25_INFO(  16, 8, 16, 1, SPI_NOR_NO_ERASE | SPI_NOR_NO_FR) },
+@@ -1158,6 +1187,320 @@ static int spi_nor_check(struct spi_nor *nor)
+ 	return 0;
+ }
+ 
++/*
++ * For given actual OTP address find the start address of OTP register/bank
++ */
++static inline loff_t spi_nor_otp_addr_to_start_addr(struct spi_nor *nor,
++			loff_t addr)
++{
++	loff_t last_bank_addr;
++
++	if (nor->otp_addr_offset)
++		last_bank_addr = nor->n_otps * nor->otp_addr_offset;
++	else
++		last_bank_addr = nor->otp_start_addr;
++
++	return addr & (last_bank_addr);
++}
++
++/*
++ * For given actual OTP address find the relative address from start of OTP
++ * register/bank
++ */
++static inline loff_t spi_nor_otp_addr_to_offset(struct spi_nor *nor,
++			loff_t addr)
++{
++		return addr & (nor->otp_size - 1);
++}
++
++/*
++ * For given linear OTP address find the actual OTP address
++ */
++static loff_t spi_nor_otp_offset_to_addr(struct spi_nor *nor, loff_t offset)
++{
++	int i;
++	loff_t addr = nor->otp_start_addr;
++
++	for (i = 0; i < nor->n_otps; i++) {
++		if (offset < ((i + 1) * nor->otp_size)) {
++			addr |= offset & (nor->otp_size - 1);
++			break;
++		}
++		addr += nor->otp_addr_offset;
++	}
++
++	return addr;
++}
++
++static ssize_t spi_nor_read_security_reg(struct spi_nor *nor, loff_t from,
++			size_t len, u_char *buf)
++{
++	int ret;
++	struct spi_nor_xfer_cfg cfg = {};
++
++	ret = spi_nor_lock_and_prep(nor, SPI_NOR_OPS_READ);
++	if (ret)
++		return ret;
++
++	cfg.cmd = nor->otp_read_opcode;
++	cfg.addr = from;
++	cfg.addr_width = nor->addr_width;
++	cfg.mode = SPI_NOR_NORMAL;
++	cfg.dummy_cycles = nor->otp_read_dummy;
++
++	ret = nor->read_xfer(nor, &cfg, buf, len);
++	spi_nor_unlock_and_unprep(nor, SPI_NOR_OPS_READ);
++	return ret;
++}
++
++static int spi_nor_read_user_otp(struct mtd_info *mtd, loff_t from, size_t len,
++			size_t *retlen, u_char *buf)
++{
++	int i;
++	int ret;
++	loff_t end_addr, reg_offset, new_addr;
++	size_t read_len;
++	struct spi_nor *nor = mtd_to_spi_nor(mtd);
++	size_t total_size = nor->otp_size * nor->n_otps;
++
++	if (from < 0 || from > total_size || (from + len) > total_size)
++		return -EINVAL;
++
++	if (!len)
++		return 0;
++
++	end_addr = from + len;
++	read_len = 0;
++
++	for (i = from; i < end_addr; i += read_len) {
++		reg_offset = i & (nor->otp_size - 1);
++
++		if (reg_offset) {
++			if ((reg_offset + len) <= nor->otp_size)
++				read_len = len;
++			else
++				read_len = nor->otp_size - reg_offset;
++		} else if ((end_addr - i) < nor->otp_size)
++			read_len = end_addr - i;
++		else
++			read_len = nor->otp_size;
++
++		new_addr = spi_nor_otp_offset_to_addr(nor, i);
++
++		ret = spi_nor_read_security_reg(nor, new_addr, read_len,
++				buf + (i - from));
++		if (ret < 0)
++			return ret;
++
++		*retlen += ret;
++	}
++
++	return 0;
++}
++
++static int spi_nor_erase_security_reg(struct spi_nor *nor, loff_t offset)
++{
++	int ret;
++	struct spi_nor_xfer_cfg cfg = {};
++
++	write_enable(nor);
++
++	cfg.cmd = nor->otp_erase_opcode;
++	cfg.addr = offset;
++	cfg.addr_width = nor->addr_width;
++	cfg.mode = SPI_NOR_NORMAL;
++
++	ret = nor->write_xfer(nor, &cfg, NULL, 0);
++
++	if (ret < 0)
++		return ret;
++
++	return spi_nor_wait_till_ready(nor);
++}
++
++static ssize_t spi_nor_write_security_reg(struct spi_nor *nor, loff_t to,
++			size_t len, u_char *buf)
++{
++	int ret;
++	struct spi_nor_xfer_cfg cfg = {};
++	u8 *reg_buf;
++	ssize_t written = 0;
++
++	reg_buf = kmalloc(nor->otp_size, GFP_KERNEL);
++	if (!reg_buf)
++		return -ENOMEM;
++
++	ret = spi_nor_read_security_reg(nor,
++			spi_nor_otp_addr_to_start_addr(nor, to),
++			nor->otp_size, reg_buf);
++	if (ret < 0)
++		goto free_buf;
++
++	memcpy(reg_buf + spi_nor_otp_addr_to_offset(nor, to), buf, len);
++
++	ret = spi_nor_lock_and_prep(nor, SPI_NOR_OPS_WRITE);
++	if (ret)
++		goto free_buf;
++
++	ret = spi_nor_erase_security_reg(nor,
++			spi_nor_otp_addr_to_start_addr(nor, to));
++	if (ret)
++		goto unlock;
++
++	cfg.cmd = nor->otp_program_opcode;
++	cfg.addr = spi_nor_otp_addr_to_start_addr(nor, to);
++	cfg.addr_width = nor->addr_width;
++	cfg.mode = SPI_NOR_NORMAL;
++
++	write_enable(nor);
++
++	ret = nor->write_xfer(nor, &cfg, reg_buf, nor->otp_size);
++	if (ret < 0)
++		goto unlock;
++
++	written = ret;
++
++	ret = spi_nor_wait_till_ready(nor);
++	if (!ret)
++		ret = written;
++
++unlock:
++	spi_nor_unlock_and_unprep(nor, SPI_NOR_OPS_WRITE);
++free_buf:
++	kfree(reg_buf);
++
++	return ret;
++}
++
++static int spi_nor_write_user_otp(struct mtd_info *mtd, loff_t to, size_t len,
++			size_t *retlen, u_char *buf)
++{
++	int ret;
++	int i;
++	loff_t end_addr, reg_offset, new_addr;
++	size_t write_len;
++	struct spi_nor *nor = mtd_to_spi_nor(mtd);
++	size_t total_size = nor->otp_size * nor->n_otps;
++
++	if (to < 0 || to > total_size || (to + len) > total_size)
++		return -EINVAL;
++
++	if (!len)
++		return 0;
++
++	end_addr = to + len;
++	write_len = 0;
++
++	for (i = to; i < end_addr; i += write_len) {
++		reg_offset = i & (nor->otp_size - 1);
++
++		if (reg_offset) {
++			if ((reg_offset + len) <= nor->otp_size)
++				write_len = len;
++			else
++				write_len = nor->otp_size - reg_offset;
++		} else if ((end_addr - i) < nor->otp_size)
++			write_len = end_addr - i;
++		else
++			write_len = nor->otp_size;
++
++		new_addr = spi_nor_otp_offset_to_addr(nor, i);
++
++		ret = spi_nor_write_security_reg(nor, new_addr, write_len,
++				buf + (i - to));
++		if (ret < 0)
++			return ret;
++
++		*retlen += ret;
++	}
++
++	return ret;
++}
++
++static int winbond_get_user_otp_info(struct mtd_info *mtd, size_t len,
++			size_t *retlen, struct otp_info *otpinfo)
++{
++	int i, ret;
++	struct spi_nor *nor = mtd_to_spi_nor(mtd);
++
++	ret = read_cr(nor);
++	if (ret < 0)
++		return ret;
++
++#define WINBOND_SR2_LB1_BIT	3	/* Lock bit for security register 1 */
++
++	for (i = 0; i < nor->n_otps; i++) {
++		otpinfo[i].start = i * nor->otp_size;
++		otpinfo[i].length = nor->otp_size;
++		otpinfo[i].locked = !!(ret & BIT(WINBOND_SR2_LB1_BIT + i));
++	}
++
++	*retlen = nor->n_otps * sizeof(*otpinfo);
++	return 0;
++}
++
++static int windbond_lock_user_otp(struct mtd_info *mtd, loff_t from, size_t len)
++{
++	int i, ret;
++	struct spi_nor *nor = mtd_to_spi_nor(mtd);
++	int s, e;
++
++	ret = read_cr(nor);
++	if (ret < 0)
++		return ret;
++
++	/* Bottom */
++	s = from;
++	do_div(s, nor->otp_size);
++	/* Ceil */
++	e = ((from + len) + (nor->otp_size - 1));
++	do_div(e, nor->otp_size);
++	if (e > nor->n_otps)
++		e = nor->n_otps;
++
++	for (i = s; i < e; i++) {
++		ret |= BIT(WINBOND_SR2_LB1_BIT + i);
++	}
++	write_enable(nor);
++	ret = write_cr(nor, ret);
++	
++	return ret;
++}
++
++static int spi_nor_set_otp_info(struct spi_nor *nor,
++			const struct flash_info *info)
++{
++	struct mtd_info *mtd = &nor->mtd;
++
++	if (!nor->read_xfer || !nor->write_xfer) {
++		dev_err(nor->dev,
++				"OTP support needs read_xfer and write_xfer hooks\n");
++		return -EINVAL;
++	}
++
++	switch (JEDEC_MFR(info)) {
++		case SNOR_MFR_WINBOND:
++			nor->otp_read_opcode = 0x48;
++			nor->otp_program_opcode = 0x42;
++			nor->otp_erase_opcode = 0x44;
++			nor->otp_read_dummy = 8;
++
++			mtd->_get_user_prot_info = winbond_get_user_otp_info;
++			mtd->_lock_user_prot_reg = windbond_lock_user_otp;
++			break;
++		default:
++			return -EINVAL;
++	}
++
++	nor->otp_size = info->otp_size;
++	nor->n_otps = info->n_otps;
++	nor->otp_start_addr = info->otp_start_addr;
++	nor->otp_addr_offset = info->otp_addr_offset;
++
++	mtd->_read_user_prot_reg = spi_nor_read_user_otp;
++	mtd->_write_user_prot_reg = spi_nor_write_user_otp;
++	return 0;
++}
+ int spi_nor_scan(struct spi_nor *nor, const char *name, enum read_mode mode)
+ {
+ 	const struct flash_info *info = NULL;
+@@ -1360,7 +1703,13 @@ int spi_nor_scan(struct spi_nor *nor, const char *name, enum read_mode mode)
+ 	} else {
+ 		nor->addr_width = 3;
+ 	}
+-
++	
++	if (info->flags & SPI_NOR_HAS_OTP) {
++		ret = spi_nor_set_otp_info(nor, info);
++		if (ret)
++			dev_warn(dev, "can't enable OTP support for %s\n",
++					info->name);
++	}
+ 	nor->read_dummy = spi_nor_read_dummy_cycles(nor);
+ 
+ 	dev_info(dev, "%s (%lld Kbytes)\n", info->name,
+diff --git a/include/linux/mtd/spi-nor.h b/include/linux/mtd/spi-nor.h
+index 5a8f786..5e6fe88 100644
+--- a/include/linux/mtd/spi-nor.h
++++ b/include/linux/mtd/spi-nor.h
+@@ -52,6 +52,7 @@
+ #define SPINOR_OP_SE		0xd8	/* Sector erase (usually 64KiB) */
+ #define SPINOR_OP_RDID		0x9f	/* Read JEDEC ID */
+ #define SPINOR_OP_RDCR		0x35	/* Read configuration register */
++#define SPINOR_OP_WRCR		0x31	/* Write configuration register */
+ #define SPINOR_OP_RDFSR		0x70	/* Read flag status register */
+ 
+ /* 4-byte address opcodes - used on Spansion and some Macronix flashes. */
+@@ -105,6 +106,33 @@ enum read_mode {
+ 	SPI_NOR_QUAD,
+ };
+ 
++/**
++ * struct spi_nor_xfer_cfg - Structure for defining a Serial Flash transfer
++ * @wren:		command for "Write Enable", or 0x00 for not required
++ * @cmd:		command for operation
++ * @cmd_pins:		number of pins to send @cmd (1, 2, 4)
++ * @addr:		address for operation
++ * @addr_pins:		number of pins to send @addr (1, 2, 4)
++ * @addr_width:		number of address bytes
++ *			(3,4, or 0 for address not required)
++ * @mode:		mode data
++ * @mode_pins:		number of pins to send @mode (1, 2, 4)
++ * @mode_cycles:	number of mode cycles (0 for mode not required)
++ * @dummy_cycles:	number of dummy cycles (0 for dummy not required)
++ */
++struct spi_nor_xfer_cfg {
++	u8		wren;
++	u8		cmd;
++	u8		cmd_pins;
++	u32		addr;
++	u8		addr_pins;
++	u8		addr_width;
++	u8		mode;
++	u8		mode_pins;
++	u8		mode_cycles;
++	u8		dummy_cycles;
++};
++
+ #define SPI_NOR_MAX_CMD_SIZE	8
+ enum spi_nor_ops {
+ 	SPI_NOR_OPS_READ = 0,
+@@ -133,11 +161,22 @@ enum spi_nor_option_flags {
+  * @flash_read:		the mode of the read
+  * @sst_write_second:	used by the SST write operation
+  * @flags:		flag options for the current SPI-NOR (SNOR_F_*)
++ * @cfg:		used by the read_xfer/write_xfer
+  * @cmd_buf:		used by the write_reg
++ * @otp_size:		size of OTP bank in bytes
++ * @n_otps:		number of OTP banks
++ * @otp_start_addr:	starting address of OTP
++ * @otp_addr_offset:	difference between consecutive OTP banks
++ * @otp_erase_opcode:	the opcode for erasing a OTP bank
++ * @otp_read_opcode:	the read opcode for OTP
++ * @otp_program_opcode:	the program opcode for OTP
++ * @otp_read_dummy:	the dummy needed by the read operation for OTP
+  * @prepare:		[OPTIONAL] do some preparations for the
+  *			read/write/erase/lock/unlock operations
+  * @unprepare:		[OPTIONAL] do some post work after the
+  *			read/write/erase/lock/unlock operations
++ * @read_xfer:		[OPTIONAL] the read fundamental primitive
++ * @write_xfer:		[OPTIONAL] the writefundamental primitive
+  * @read_reg:		[DRIVER-SPECIFIC] read out the register
+  * @write_reg:		[DRIVER-SPECIFIC] write data to the register
+  * @read:		[DRIVER-SPECIFIC] read data from the SPI NOR
+@@ -164,10 +203,23 @@ struct spi_nor {
+ 	enum read_mode		flash_read;
+ 	bool			sst_write_second;
+ 	u32			flags;
++	struct spi_nor_xfer_cfg	cfg;
+ 	u8			cmd_buf[SPI_NOR_MAX_CMD_SIZE];
++	unsigned int		otp_size;
++	u16					n_otps;
++	loff_t				otp_start_addr;
++	loff_t				otp_addr_offset;
++	u8					otp_erase_opcode;
++	u8					otp_read_opcode;
++	u8					otp_program_opcode;
++	u8					otp_read_dummy;
+ 
+ 	int (*prepare)(struct spi_nor *nor, enum spi_nor_ops ops);
+ 	void (*unprepare)(struct spi_nor *nor, enum spi_nor_ops ops);
++	ssize_t (*read_xfer)(struct spi_nor *nor, struct spi_nor_xfer_cfg *cfg,
++			u8 *buf, size_t len);
++	ssize_t (*write_xfer)(struct spi_nor *nor, struct spi_nor_xfer_cfg *cfg,
++			u8 *buf, size_t len);
+ 	int (*read_reg)(struct spi_nor *nor, u8 opcode, u8 *buf, int len);
+ 	int (*write_reg)(struct spi_nor *nor, u8 opcode, u8 *buf, int len);
+ 

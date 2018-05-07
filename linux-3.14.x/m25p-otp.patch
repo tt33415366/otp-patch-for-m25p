@@ -1,0 +1,751 @@
+diff --git a/drivers/mtd/devices/m25p80.c b/drivers/mtd/devices/m25p80.c
+index 7d59d07..b6003dc 100644
+--- a/drivers/mtd/devices/m25p80.c
++++ b/drivers/mtd/devices/m25p80.c
+@@ -35,6 +35,8 @@
+ #include <linux/spi/spi.h>
+ #include <linux/spi/flash.h>
+ 
++#include <asm/div64.h>
++
+ /* Flash opcodes. */
+ #define	OPCODE_WREN		0x06	/* Write enable */
+ #define	OPCODE_RDSR		0x05	/* Read status register */
+@@ -50,6 +52,7 @@
+ #define	OPCODE_SE		0xd8	/* Sector erase (usually 64KiB) */
+ #define	OPCODE_RDID		0x9f	/* Read JEDEC ID */
+ #define	OPCODE_RDCR             0x35    /* Read configuration register */
++#define	OPCODE_WRCR             0x31    /* Write configuration register */
+ 
+ /* 4-byte address opcodes - used on Spansion and some Macronix flashes. */
+ #define	OPCODE_NORM_READ_4B	0x13	/* Read data bytes (low frequency) */
+@@ -104,6 +107,33 @@ enum read_type {
+ 	M25P80_QUAD,
+ };
+ 
++/**
++ * struct spi_nor_xfer_cfg - Structure for defining a Serial Flash transfer
++ * @wren:		command for "Write Enable", or 0x00 for not required
++ * @cmd:		command for operation
++ * @cmd_pins:		number of pins to send @cmd (1, 2, 4)
++ * @addr:		address for operation
++ * @addr_pins:		number of pins to send @addr (1, 2, 4)
++ * @addr_width:		number of address bytes
++ *			(3,4, or 0 for address not required)
++ * @mode:		mode data
++ * @mode_pins:		number of pins to send @mode (1, 2, 4)
++ * @mode_cycles:	number of mode cycles (0 for mode not required)
++ * @dummy_cycles:	number of dummy cycles (0 for dummy not required)
++ */
++struct spi_nor_xfer_cfg {
++	u8		wren;
++	u8		cmd;
++	u8		cmd_pins;
++	u32		addr;
++	u8		addr_pins;
++	u8		addr_width;
++	u8		mode;
++	u8		mode_pins;
++	u8		mode_cycles;
++	u8		dummy_cycles;
++};
++
+ struct m25p {
+ 	struct spi_device	*spi;
+ 	struct mutex		lock;
+@@ -115,6 +145,20 @@ struct m25p {
+ 	u8			program_opcode;
+ 	u8			*command;
+ 	enum read_type		flash_read;
++	/* Lea: OTP related */
++	struct spi_nor_xfer_cfg	cfg;
++	unsigned int		otp_size;
++	u16					n_otps;
++	loff_t				otp_start_addr;
++	loff_t				otp_addr_offset;
++	u8					otp_erase_opcode;
++	u8					otp_read_opcode;
++	u8					otp_program_opcode;
++	u8					otp_read_dummy;
++	ssize_t (*read_xfer)(struct m25p *flash, struct spi_nor_xfer_cfg *cfg,
++					u8 *buf, size_t len);
++	ssize_t (*write_xfer)(struct m25p *flash, struct spi_nor_xfer_cfg *cfg,
++					u8 *buf, size_t len);
+ };
+ 
+ static inline struct m25p *mtd_to_m25p(struct mtd_info *mtd)
+@@ -182,6 +226,14 @@ static int write_sr(struct m25p *flash, u8 val)
+ 	return spi_write(flash->spi, flash->command, 2);
+ }
+ 
++static int write_cr(struct m25p *flash, u8 val)
++{
++	flash->command[0] = OPCODE_WRCR;
++	flash->command[1] = val;
++
++	return spi_write(flash->spi, flash->command, 2);
++}
++
+ /*
+  * Set write enable latch with Write Enable command.
+  * Returns negative if error occurred.
+@@ -371,18 +423,18 @@ static int erase_chip(struct m25p *flash)
+ 	return 0;
+ }
+ 
+-static void m25p_addr2cmd(struct m25p *flash, unsigned int addr, u8 *cmd)
++static void m25p_addr2cmd(unsigned int addr, u8 addr_width, u8 *cmd)
+ {
+ 	/* opcode is in cmd[0] */
+-	cmd[1] = addr >> (flash->addr_width * 8 -  8);
+-	cmd[2] = addr >> (flash->addr_width * 8 - 16);
+-	cmd[3] = addr >> (flash->addr_width * 8 - 24);
+-	cmd[4] = addr >> (flash->addr_width * 8 - 32);
++	cmd[1] = addr >> (addr_width * 8 -  8);
++	cmd[2] = addr >> (addr_width * 8 - 16);
++	cmd[3] = addr >> (addr_width * 8 - 24);
++	cmd[4] = addr >> (addr_width * 8 - 32);
+ }
+ 
+-static int m25p_cmdsz(struct m25p *flash)
++static int m25p_cmdsz(u8 addr_width)
+ {
+-	return 1 + flash->addr_width;
++	return 1 + addr_width;
+ }
+ 
+ /*
+@@ -405,9 +457,9 @@ static int erase_sector(struct m25p *flash, u32 offset)
+ 
+ 	/* Set up command buffer. */
+ 	flash->command[0] = flash->erase_opcode;
+-	m25p_addr2cmd(flash, offset, flash->command);
++	m25p_addr2cmd(offset, flash->addr_width, flash->command);
+ 
+-	spi_write(flash->spi, flash->command, m25p_cmdsz(flash));
++	spi_write(flash->spi, flash->command, m25p_cmdsz(flash->addr_width));
+ 
+ 	return 0;
+ }
+@@ -495,14 +547,16 @@ static inline int m25p80_dummy_cycles_read(struct m25p *flash)
+ 	}
+ }
+ 
+-static inline unsigned int m25p80_rx_nbits(const struct m25p *flash)
++static inline unsigned int m25p80_rx_nbits(enum read_type flash_read)
+ {
+-	switch (flash->flash_read) {
++	switch (flash_read) {
+ 	case M25P80_QUAD:
+ 		return 4;
+ 	default:
+ 		return 0;
+ 	}
++
++	return 0;
+ }
+ 
+ /*
+@@ -531,11 +585,11 @@ static int m25p80_read(struct mtd_info *mtd, loff_t from, size_t len,
+ 	}
+ 
+ 	t[0].tx_buf = flash->command;
+-	t[0].len = m25p_cmdsz(flash) + dummy;
++	t[0].len = m25p_cmdsz(flash->addr_width) + dummy;
+ 	spi_message_add_tail(&t[0], &m);
+ 
+ 	t[1].rx_buf = buf;
+-	t[1].rx_nbits = m25p80_rx_nbits(flash);
++	t[1].rx_nbits = m25p80_rx_nbits(flash->flash_read);
+ 	t[1].len = len;
+ 	spi_message_add_tail(&t[1], &m);
+ 
+@@ -551,17 +605,92 @@ static int m25p80_read(struct mtd_info *mtd, loff_t from, size_t len,
+ 	/* Set up the write data buffer. */
+ 	opcode = flash->read_opcode;
+ 	flash->command[0] = opcode;
+-	m25p_addr2cmd(flash, from, flash->command);
++	m25p_addr2cmd(from, flash->addr_width, flash->command);
+ 
+ 	spi_sync(flash->spi, &m);
+ 
+-	*retlen = m.actual_length - m25p_cmdsz(flash) - dummy;
++	*retlen = m.actual_length - m25p_cmdsz(flash->addr_width) - dummy;
+ 
+ 	mutex_unlock(&flash->lock);
+ 
+ 	return 0;
+ }
+ 
++static ssize_t m25p80_read_xfer(struct m25p *flash,
++				struct spi_nor_xfer_cfg *cfg,
++						u8 *buf, size_t len)
++{
++	struct spi_device *spi = flash->spi;
++	struct spi_transfer t[2] = {};
++	struct spi_message m;
++	unsigned int dummy = cfg->dummy_cycles;
++	ssize_t ret;
++
++	/* convert the dummy cycles to the number of bytes */
++	dummy /= 8;
++
++	spi_message_init(&m);
++
++	flash->command[0] = cfg->cmd;
++	m25p_addr2cmd(cfg->addr, cfg->addr_width, flash->command);
++
++	t[0].tx_buf = flash->command;
++	t[0].len = m25p_cmdsz(cfg->addr_width) + dummy;
++	spi_message_add_tail(&t[0], &m);
++
++	t[1].rx_buf = buf;
++	t[1].rx_nbits = m25p80_rx_nbits(cfg->mode);
++	t[1].len = len;
++	spi_message_add_tail(&t[1], &m);
++
++	ret = spi_sync(spi, &m);
++	if (ret)
++		return ret;
++
++	ret = m.actual_length - m25p_cmdsz(cfg->addr_width) - dummy;
++	if (ret < 0)
++		return -EIO;
++	return ret;
++}
++
++static ssize_t m25p80_write_xfer(struct m25p *flash,
++				struct spi_nor_xfer_cfg *cfg,
++						u8 *buf, size_t len)
++{
++	struct spi_device *spi = flash->spi;
++	struct spi_transfer t[2] = {};
++	struct spi_message m;
++	unsigned int dummy = cfg->dummy_cycles;
++	ssize_t ret;
++
++	/* convert the dummy cycles to the number of bytes */
++	dummy /= 8;
++
++	spi_message_init(&m);
++
++	flash->command[0] = cfg->cmd;
++	m25p_addr2cmd(cfg->addr, cfg->addr_width, flash->command);
++
++	t[0].tx_buf = flash->command;
++	t[0].len = m25p_cmdsz(cfg->addr_width) + dummy;
++	spi_message_add_tail(&t[0], &m);
++
++	if (len) {
++		t[1].tx_buf = buf;
++		t[1].len = len;
++		spi_message_add_tail(&t[1], &m);
++	}
++
++	ret = spi_sync(spi, &m);
++	if (ret)
++		return ret;
++
++	ret = m.actual_length - m25p_cmdsz(cfg->addr_width) - dummy;
++	if (ret < 0)
++		return -EIO;
++	return ret;
++}
++
+ /*
+  * Write an address range to the flash chip.  Data must be written in
+  * FLASH_PAGESIZE chunks.  The address range may be any size provided
+@@ -582,7 +711,7 @@ static int m25p80_write(struct mtd_info *mtd, loff_t to, size_t len,
+ 	memset(t, 0, (sizeof t));
+ 
+ 	t[0].tx_buf = flash->command;
+-	t[0].len = m25p_cmdsz(flash);
++	t[0].len = m25p_cmdsz(flash->addr_width);
+ 	spi_message_add_tail(&t[0], &m);
+ 
+ 	t[1].tx_buf = buf;
+@@ -600,7 +729,7 @@ static int m25p80_write(struct mtd_info *mtd, loff_t to, size_t len,
+ 
+ 	/* Set up the opcode in the write buffer. */
+ 	flash->command[0] = flash->program_opcode;
+-	m25p_addr2cmd(flash, to, flash->command);
++	m25p_addr2cmd(to, flash->addr_width, flash->command);
+ 
+ 	page_offset = to & (flash->page_size - 1);
+ 
+@@ -610,7 +739,7 @@ static int m25p80_write(struct mtd_info *mtd, loff_t to, size_t len,
+ 
+ 		spi_sync(flash->spi, &m);
+ 
+-		*retlen = m.actual_length - m25p_cmdsz(flash);
++		*retlen = m.actual_length - m25p_cmdsz(flash->addr_width);
+ 	} else {
+ 		u32 i;
+ 
+@@ -620,7 +749,7 @@ static int m25p80_write(struct mtd_info *mtd, loff_t to, size_t len,
+ 		t[1].len = page_size;
+ 		spi_sync(flash->spi, &m);
+ 
+-		*retlen = m.actual_length - m25p_cmdsz(flash);
++		*retlen = m.actual_length - m25p_cmdsz(flash->addr_width);
+ 
+ 		/* write everything in flash->page_size chunks */
+ 		for (i = page_size; i < len; i += page_size) {
+@@ -629,7 +758,7 @@ static int m25p80_write(struct mtd_info *mtd, loff_t to, size_t len,
+ 				page_size = flash->page_size;
+ 
+ 			/* write the next page to flash */
+-			m25p_addr2cmd(flash, to + i, flash->command);
++			m25p_addr2cmd(to + i, flash->addr_width, flash->command);
+ 
+ 			t[1].tx_buf = buf + i;
+ 			t[1].len = page_size;
+@@ -640,7 +769,7 @@ static int m25p80_write(struct mtd_info *mtd, loff_t to, size_t len,
+ 
+ 			spi_sync(flash->spi, &m);
+ 
+-			*retlen += m.actual_length - m25p_cmdsz(flash);
++			*retlen += m.actual_length - m25p_cmdsz(flash->addr_width);
+ 		}
+ 	}
+ 
+@@ -665,7 +794,7 @@ static int sst_write(struct mtd_info *mtd, loff_t to, size_t len,
+ 	memset(t, 0, (sizeof t));
+ 
+ 	t[0].tx_buf = flash->command;
+-	t[0].len = m25p_cmdsz(flash);
++	t[0].len = m25p_cmdsz(flash->addr_width);
+ 	spi_message_add_tail(&t[0], &m);
+ 
+ 	t[1].tx_buf = buf;
+@@ -684,7 +813,7 @@ static int sst_write(struct mtd_info *mtd, loff_t to, size_t len,
+ 	/* Start write from odd address. */
+ 	if (actual) {
+ 		flash->command[0] = OPCODE_BP;
+-		m25p_addr2cmd(flash, to, flash->command);
++		m25p_addr2cmd(to, flash->addr_width, flash->command);
+ 
+ 		/* write one byte. */
+ 		t[1].len = 1;
+@@ -692,15 +821,15 @@ static int sst_write(struct mtd_info *mtd, loff_t to, size_t len,
+ 		ret = wait_till_ready(flash);
+ 		if (ret)
+ 			goto time_out;
+-		*retlen += m.actual_length - m25p_cmdsz(flash);
++		*retlen += m.actual_length - m25p_cmdsz(flash->addr_width);
+ 	}
+ 	to += actual;
+ 
+ 	flash->command[0] = OPCODE_AAI_WP;
+-	m25p_addr2cmd(flash, to, flash->command);
++	m25p_addr2cmd(to, flash->addr_width, flash->command);
+ 
+ 	/* Write out most of the data here. */
+-	cmd_sz = m25p_cmdsz(flash);
++	cmd_sz = m25p_cmdsz(flash->addr_width);
+ 	for (; actual < len - 1; actual += 2) {
+ 		t[0].len = cmd_sz;
+ 		/* write two bytes. */
+@@ -724,8 +853,8 @@ static int sst_write(struct mtd_info *mtd, loff_t to, size_t len,
+ 	if (actual != len) {
+ 		write_enable(flash);
+ 		flash->command[0] = OPCODE_BP;
+-		m25p_addr2cmd(flash, to, flash->command);
+-		t[0].len = m25p_cmdsz(flash);
++		m25p_addr2cmd(to, flash->addr_width, flash->command);
++		t[0].len = m25p_cmdsz(flash->addr_width);
+ 		t[1].len = 1;
+ 		t[1].tx_buf = buf + actual;
+ 
+@@ -733,7 +862,7 @@ static int sst_write(struct mtd_info *mtd, loff_t to, size_t len,
+ 		ret = wait_till_ready(flash);
+ 		if (ret)
+ 			goto time_out;
+-		*retlen += m.actual_length - m25p_cmdsz(flash);
++		*retlen += m.actual_length - m25p_cmdsz(flash->addr_width);
+ 		write_disable(flash);
+ 	}
+ 
+@@ -862,6 +991,15 @@ struct flash_info {
+ #define	M25P_NO_FR	0x08		/* Can't do fastread */
+ #define	SECT_4K_PMC	0x10		/* OPCODE_BE_4K_PMC works uniformly */
+ #define	M25P80_QUAD_READ	0x20    /* Flash supports Quad Read */
++#define M25P_HAS_OTP		BIT(12)	/* Flash supports OTP */
++
++	unsigned int	otp_size;	/* OTP size in bytes */
++	u16				n_otps;		/* Number of OTP banks */
++	loff_t			otp_start_addr;	/* Starting address of OTP area */
++
++	/* Difference between consecutive OTP banks if there are many */
++	loff_t			otp_addr_offset;
++
+ };
+ 
+ #define INFO(_jedec_id, _ext_id, _sector_size, _n_sectors, _flags)	\
+@@ -883,6 +1021,22 @@ struct flash_info {
+ 		.flags = (_flags),					\
+ 	})
+ 
++#define OTP_INFO(_jedec_id, _ext_id, _sector_size, _n_sectors, _flags, \
++		_otp_size, _n_otps, _otp_start_addr, _otp_addr_offset)	\
++	((kernel_ulong_t)&(struct flash_info) {             \
++		.jedec_id = (_jedec_id),                \
++		.ext_id = (_ext_id),                    \
++		.sector_size = (_sector_size),              \
++		.n_sectors = (_n_sectors),              \
++		.page_size = 256,                   \
++		.flags = (_flags),                  \
++		.otp_size = (_otp_size),				\
++		.n_otps = (_n_otps),					\
++		.otp_start_addr = (_otp_start_addr),			\
++		.otp_addr_offset = (_otp_addr_offset), \
++	 })
++
++
+ /* NOTE: double check command sets and memory organization when you add
+  * more flash chips.  This current list focusses on newer chips, which
+  * have been converging on command sets which including JEDEC ID.
+@@ -1047,7 +1201,7 @@ static const struct spi_device_id m25p_ids[] = {
+ 	{ "w25q80bl", INFO(0xef4014, 0, 64 * 1024,  16, SECT_4K) },
+ 	{ "w25q128", INFO(0xef4018, 0, 64 * 1024, 256, SECT_4K) },
+ 	{ "w25q128fw", INFO(0xef6018, 0, 64 * 1024, 256, SECT_4K) },
+-	{ "w25q256", INFO(0xef4019, 0, 64 * 1024, 512, SECT_4K) },
++	{ "w25q256", OTP_INFO(0xef4019, 0, 64 * 1024, 512, SECT_4K | M25P_HAS_OTP, 256, 3, 0x1000, 0x1000) },
+ 
+ 	/* Catalyst / On Semiconductor -- non-JEDEC */
+ 	{ "cat25c11", CAT25_INFO(  16, 8, 16, 1, M25P_NO_ERASE | M25P_NO_FR) },
+@@ -1059,6 +1213,317 @@ static const struct spi_device_id m25p_ids[] = {
+ };
+ MODULE_DEVICE_TABLE(spi, m25p_ids);
+ 
++/*
++ * For given actual OTP address find the start address of OTP register/bank
++ */
++static inline loff_t m25p_otp_addr_to_start_addr(struct m25p *flash,
++					loff_t addr)
++{
++	loff_t last_bank_addr;
++
++	if (flash->otp_addr_offset)
++		last_bank_addr = flash->n_otps * flash->otp_addr_offset;
++	else
++		last_bank_addr = flash->otp_start_addr;
++
++	return addr & (last_bank_addr);
++}
++
++/*
++ * For given actual OTP address find the relative address from start of OTP
++ * register/bank
++ */
++static inline loff_t m25p_otp_addr_to_offset(struct m25p *flash,
++					loff_t addr)
++{
++	return addr & (flash->otp_size - 1);
++}
++
++/*
++ * For given linear OTP address find the actual OTP address
++ */
++static loff_t m25p_otp_offset_to_addr(struct m25p *flash, loff_t offset)
++{
++	int i;
++	loff_t addr = flash->otp_start_addr;
++
++	for (i = 0; i < flash->n_otps; i++) {
++		if (offset < ((i + 1) * flash->otp_size)) {
++			addr |= offset & (flash->otp_size - 1);
++			break;
++		}
++		addr += flash->otp_addr_offset;
++	}
++
++	return addr;
++}
++
++static ssize_t m25p_read_security_reg(struct m25p *flash, loff_t from,
++					size_t len, u_char *buf)
++{
++	int ret;
++	struct spi_nor_xfer_cfg cfg = {};
++
++	mutex_lock(&flash->lock);
++
++	cfg.cmd = flash->otp_read_opcode;
++	cfg.addr = from;
++	cfg.addr_width = flash->addr_width;
++	cfg.mode = M25P80_NORMAL;
++	cfg.dummy_cycles = flash->otp_read_dummy;
++
++	ret = flash->read_xfer(flash, &cfg, buf, len);
++	mutex_unlock(&flash->lock);
++	return ret;
++}
++
++static int m25p_read_user_otp(struct mtd_info *mtd, loff_t from, size_t len,
++					size_t *retlen, u_char *buf)
++{
++	int i;
++	int ret;
++	loff_t end_addr, reg_offset, new_addr;
++	size_t read_len;
++	struct m25p *flash = mtd_to_m25p(mtd);
++	size_t total_size = flash->otp_size * flash->n_otps;
++
++	if (from < 0 || from > total_size || (from + len) > total_size)
++		return -EINVAL;
++
++	if (!len)
++		return 0;
++
++	end_addr = from + len;
++	read_len = 0;
++
++	for (i = from; i < end_addr; i += read_len) {
++		reg_offset = i & (flash->otp_size - 1);
++
++		if (reg_offset) {
++			if ((reg_offset + len) <= flash->otp_size)
++				read_len = len;
++			else
++				read_len = flash->otp_size - reg_offset;
++		} else if ((end_addr - i) < flash->otp_size)
++			read_len = end_addr - i;
++		else
++			read_len = flash->otp_size;
++
++		new_addr = m25p_otp_offset_to_addr(flash, i);
++
++		ret = m25p_read_security_reg(flash, new_addr, read_len,
++				buf + (i - from));
++		if (ret < 0)
++			return ret;
++
++		*retlen += ret;
++	}
++
++	return 0;
++}
++
++static int m25p_erase_security_reg(struct m25p *flash, loff_t offset)
++{
++	int ret;
++	struct spi_nor_xfer_cfg cfg = {};
++
++	write_enable(flash);
++
++	cfg.cmd = flash->otp_erase_opcode;
++	cfg.addr = offset;
++	cfg.addr_width = flash->addr_width;
++	cfg.mode = M25P80_NORMAL;
++
++	ret = flash->write_xfer(flash, &cfg, NULL, 0);
++
++	if (ret < 0)
++		return ret;
++
++	return wait_till_ready(flash);
++}
++
++static ssize_t m25p_write_security_reg(struct m25p *flash, loff_t to,
++					size_t len, u_char *buf)
++{
++	int ret;
++	struct spi_nor_xfer_cfg cfg = {};
++	u8 *reg_buf;
++	ssize_t written = 0;
++
++	reg_buf = kmalloc(flash->otp_size, GFP_KERNEL);
++	if (!reg_buf)
++		return -ENOMEM;
++
++	ret = m25p_read_security_reg(flash,
++			m25p_otp_addr_to_start_addr(flash, to),
++			flash->otp_size, reg_buf);
++	if (ret < 0)
++		goto free_buf;
++
++	memcpy(reg_buf + m25p_otp_addr_to_offset(flash, to), buf, len);
++
++	mutex_lock(&flash->lock);
++
++	ret = m25p_erase_security_reg(flash,
++			m25p_otp_addr_to_start_addr(flash, to));
++	if (ret)
++		goto unlock;
++
++	cfg.cmd = flash->otp_program_opcode;
++	cfg.addr = m25p_otp_addr_to_start_addr(flash, to);
++	cfg.addr_width = flash->addr_width;
++	cfg.mode = M25P80_NORMAL;
++
++	write_enable(flash);
++
++	ret = flash->write_xfer(flash, &cfg, reg_buf, flash->otp_size);
++	if (ret < 0)
++		goto unlock;
++
++	written = ret;
++
++	ret = wait_till_ready(flash);
++	if (!ret)
++		ret = written;
++
++unlock:
++	mutex_unlock(&flash->lock);
++free_buf:
++	kfree(reg_buf);
++
++	return ret;
++}
++
++static int m25p_write_user_otp(struct mtd_info *mtd, loff_t to, size_t len,
++					size_t *retlen, u_char *buf)
++{
++	int ret;
++	int i;
++	loff_t end_addr, reg_offset, new_addr;
++	size_t write_len;
++	struct m25p *flash = mtd_to_m25p(mtd);
++	size_t total_size = flash->otp_size * flash->n_otps;
++
++	if (to < 0 || to > total_size || (to + len) > total_size)
++		return -EINVAL;
++
++	if (!len)
++		return 0;
++
++	end_addr = to + len;
++	write_len = 0;
++
++	for (i = to; i < end_addr; i += write_len) {
++		reg_offset = i & (flash->otp_size - 1);
++
++		if (reg_offset) {
++			if ((reg_offset + len) <= flash->otp_size)
++				write_len = len;
++			else
++				write_len = flash->otp_size - reg_offset;
++		} else if ((end_addr - i) < flash->otp_size)
++			write_len = end_addr - i;
++		else
++			write_len = flash->otp_size;
++
++		new_addr = m25p_otp_offset_to_addr(flash, i);
++
++		ret = m25p_write_security_reg(flash, new_addr, write_len,
++				buf + (i - to));
++		if (ret < 0)
++			return ret;
++
++		*retlen += ret;
++	}
++
++	return ret;
++}
++
++static int winbond_get_user_otp_info(struct mtd_info *mtd,
++		struct otp_info *otpinfo, size_t len)
++{
++	int i, ret;
++	struct m25p *flash = mtd_to_m25p(mtd);
++
++	ret = read_cr(flash);
++	if (ret < 0)
++		return ret;
++
++#define WINBOND_SR2_LB1_BIT	3	/* Lock bit for security register 1 */
++
++	for (i = 0; i < flash->n_otps; i++) {
++		otpinfo[i].start = i * flash->otp_size;
++		otpinfo[i].length = flash->otp_size;
++		otpinfo[i].locked = !!(ret & BIT(WINBOND_SR2_LB1_BIT + i));
++	}
++
++	return flash->n_otps * sizeof(*otpinfo);
++}
++
++static int windbond_lock_user_otp(struct mtd_info *mtd, loff_t from,
++		size_t len)
++{
++	int i, ret;
++	struct m25p *flash = mtd_to_m25p(mtd);
++	int s, e;
++
++	ret = read_cr(flash);
++	if (ret < 0)
++		return ret;
++
++	/* Bottom */
++	s = from;
++	do_div(s, flash->otp_size);
++	/* Ceil */
++	e = ((from + len) + (flash->otp_size - 1));
++	do_div(e, flash->otp_size);
++	if (e > flash->n_otps)
++		e = flash->n_otps;
++
++	for (i = s; i < e; i++) {
++		ret |= BIT(WINBOND_SR2_LB1_BIT + i);
++	}
++	write_enable(flash);
++	ret = write_cr(flash, ret);
++
++	return ret;
++}
++
++static int m25p_set_otp_info(struct m25p *flash,
++					const struct flash_info *info)
++{
++	struct mtd_info *mtd = &flash->mtd;
++
++	if (!flash->read_xfer || !flash->write_xfer) {
++		dev_err(&flash->spi->dev,
++				"OTP support needs read_xfer and write_xfer hooks\n");
++		return -EINVAL;
++	}
++
++	switch (JEDEC_MFR(info->jedec_id)) {
++		case 0xef: /* Winbond SNOR */
++			flash->otp_read_opcode = 0x48;
++			flash->otp_program_opcode = 0x42;
++			flash->otp_erase_opcode = 0x44;
++			flash->otp_read_dummy = 8;
++
++			mtd->_get_user_prot_info = winbond_get_user_otp_info;
++			mtd->_lock_user_prot_reg = windbond_lock_user_otp;
++			break;
++		default:
++			return -EINVAL;
++	}
++
++	flash->otp_size = info->otp_size;
++	flash->n_otps = info->n_otps;
++	flash->otp_start_addr = info->otp_start_addr;
++	flash->otp_addr_offset = info->otp_addr_offset;
++
++	mtd->_read_user_prot_reg = m25p_read_user_otp;
++	mtd->_write_user_prot_reg = m25p_write_user_otp;
++	return 0;
++}
++
+ static const struct spi_device_id *jedec_probe(struct spi_device *spi,
+ 						struct device_node *np)
+ {
+@@ -1328,6 +1793,16 @@ static int m25p_probe(struct spi_device *spi)
+ 	} else {
+ 		flash->addr_width = 3;
+ 	}
++	flash->read_xfer = m25p80_read_xfer;
++	flash->write_xfer = m25p80_write_xfer;
++
++	if (info->flags & M25P_HAS_OTP) {
++		ret = m25p_set_otp_info(flash, info);
++		if (ret)
++			dev_warn(&spi->dev, "can't enable OTP support for %s\n",
++					id->name);
++	}
++
+ 
+ 	dev_info(&spi->dev, "%s (%lld Kbytes)\n", id->name,
+ 			(long long)flash->mtd.size >> 10);
